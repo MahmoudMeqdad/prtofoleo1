@@ -1,0 +1,4 @@
+﻿code,name_ar,name_en,description,credit_hours,instructor,day,start_time,end_time,room,semester
+CS101,مقدمة في علوم الحاسوب,Introduction to Computer Science,مفاهيم البرمجة والخوارزميات الأساسية,3,د. أحمد منصور,الأحد,09:00,10:30,A-101,2026-1
+CS205,قواعد البيانات,Database Systems,النمذجة العلائقية وSQL,3,د. سارة خليل,الاثنين,11:00,12:30,B-204,2026-1
+CS310,الذكاء الاصطناعي,Artificial Intelligence,البحث والاستدلال والتعلم الآلي,3,د. محمود سالم,الأحد,13:00,14:30,C-301,2026-1

@@ -1,0 +1,36 @@
+Deep Source Mode — Research Design
+
+Pipeline:
+User Query
+  ↓
+Conversation-aware rewritten query
+  ↓
+Multi-query generation
+  ↓
+Semantic retrieval + lexical retrieval
+  ↓
+Candidate fusion and deduplication
+  ↓
+Neighbor-page expansion
+  ↓
+Hybrid reranking
+  ↓
+Evidence sufficiency assessment
+  ├─ sufficient → answer generation
+  └─ insufficient → follow-up query generation → second retrieval
+  ↓
+Source-grounded answer with [S#] citations
+  ↓
+Research logging and user feedback
+
+Measurable variables:
+- retrieval_mode
+- query_variants_count
+- retrieval_stages
+- candidate_count
+- evidence_count
+- evidence_sufficient
+- evidence_confidence
+- missing_evidence
+- response_time_ms
+- user_rating

@@ -1,0 +1,7 @@
+.env
+research.db
+research_logs.csv
+downloads/
+vector_db/
+__pycache__/
+*.pyc
