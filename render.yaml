@@ -1,0 +1,16 @@
+services:
+  - type: worker
+    name: university-course-assistant
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    autoDeploy: true
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: GEMINI_CHAT_MODEL
+        value: gemini-2.5-flash
+      - key: DEEP_MODE_DEFAULT
+        value: "false"

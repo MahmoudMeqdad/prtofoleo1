@@ -100,6 +100,44 @@ python bot.py
 /export_logs
 لتصدير السجلات البحثية.
 
+التشغيل السحابي (24/7 بدون جهازك)
+=================================
+
+المشروع جاهز للرفع على Railway أو Render.
+لا تستخدم Vercel — البوت يحتاج عملية مستمرة (polling).
+
+الطريقة الموصى بها: Railway
+---------------------------
+
+1. ارفع التعديلات إلى GitHub (Dockerfile / Procfile / railway.toml).
+2. ادخل https://railway.app وسجّل بحساب GitHub.
+3. New Project → Deploy from GitHub repo → اختر هذا المستودع.
+4. في Variables أضف:
+
+TELEGRAM_TOKEN=توكن_البوت
+GOOGLE_API_KEY=مفتاح_جيميني
+
+5. Deploy وانتظر حتى تظهر في الـ Logs رسالة تشغيل البوت.
+6. مهم: أوقف البوت على جهازك المحلي بعد نجاح الرفع
+   (لا تشغّل نسختين بنفس التوكن في نفس الوقت).
+
+بديل: Render
+------------
+
+1. ادخل https://render.com
+2. New → Background Worker
+3. اربط مستودع GitHub
+4. Runtime: Docker (يستخدم Dockerfile)
+5. أضف نفس المتغيرات TELEGRAM_TOKEN و GOOGLE_API_KEY
+
+ملاحظات التخزين
+---------------
+
+- الملفات المحلية (vector_db / research.db) على السحابة قد تُعاد
+  عند إعادة النشر إن لم تُضف Volume دائمة.
+- للبيانات المهمة على المدى الطويل: أضف Persistent Volume في Railway
+  ووجّهه إلى مجلد المشروع، أو صدّر السجلات دوريًا بـ /export_logs.
+
 ملاحظات
 =======
 

@@ -1,0 +1,14 @@
+.venv
+venv
+__pycache__
+*.pyc
+.env
+.git
+.gitignore
+downloads
+vector_db
+research.db
+research_logs.csv
+*.md
+README.txt
+DEEP_SOURCE_DESIGN.txt
