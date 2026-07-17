@@ -27,6 +27,9 @@ from telegram.ext import (
     filters,
 )
 from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._errors import IpBlocked, RequestBlocked
+from youtube_transcript_api.proxies import GenericProxyConfig, WebshareProxyConfig
+from yt_dlp import YoutubeDL
 from google import genai
 from google.genai import types
 
@@ -55,10 +58,16 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
 
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN غير موجود في ملف .env")
+    raise RuntimeError(
+        "TELEGRAM_TOKEN غير موجود. أضفه في ملف .env محلياً، "
+        "أو في Variables على Railway/Render عند النشر."
+    )
 
 if not GOOGLE_API_KEY:
-    raise RuntimeError("GOOGLE_API_KEY غير موجود في ملف .env")
+    raise RuntimeError(
+        "GOOGLE_API_KEY غير موجود. أضفه في ملف .env محلياً، "
+        "أو في Variables على Railway/Render عند النشر."
+    )
 DOWNLOADS_DIR = BASE_DIR / "downloads"
 VECTOR_DB_DIR = BASE_DIR / "vector_db"
 
@@ -73,8 +82,16 @@ MAX_WEB_TEXT_CHARS = 100_000
 MAX_HISTORY_MESSAGES = 10
 TELEGRAM_TEXT_LIMIT = 3900
 
-# Gemini 2.5 Flash يدعم نافذة إدخال تصل إلى نحو مليون توكن.
-CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-2.5-flash")
+# النموذج الافتراضي مجاني وبسقف منفصل عن gemini-2.5-flash.
+CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-flash-lite-latest")
+CHAT_MODEL_FALLBACKS = [
+    model.strip()
+    for model in os.getenv(
+        "GEMINI_CHAT_FALLBACKS",
+        "gemini-2.0-flash-lite,gemini-2.5-flash,gemini-2.0-flash,gemini-flash-latest",
+    ).split(",")
+    if model.strip() and model.strip() != CHAT_MODEL
+]
 EMBEDDING_MODEL = os.getenv(
     "GEMINI_EMBEDDING_MODEL",
     "models/gemini-embedding-001",
@@ -147,14 +164,66 @@ embeddings = GoogleGenerativeAIEmbeddings(
     google_api_key=GOOGLE_API_KEY,
 )
 
-llm = ChatGoogleGenerativeAI(
-    model=CHAT_MODEL,
-    google_api_key=GOOGLE_API_KEY,
-    temperature=0.2,
-    max_output_tokens=MAX_OUTPUT_TOKENS,
-    timeout=120,
-    max_retries=3,
-)
+
+def _is_quota_or_overload_error(exc: BaseException) -> bool:
+    text = str(exc)
+    lowered = text.lower()
+    return (
+        "RESOURCE_EXHAUSTED" in text
+        or "exceeded your current quota" in lowered
+        or "UNAVAILABLE" in text
+        or "high demand" in lowered
+        or ("429" in text and "quota" in lowered)
+        or "503" in text
+    )
+
+
+def build_chat_llm(model_name: str) -> ChatGoogleGenerativeAI:
+    return ChatGoogleGenerativeAI(
+        model=model_name,
+        google_api_key=GOOGLE_API_KEY,
+        temperature=0.2,
+        max_output_tokens=MAX_OUTPUT_TOKENS,
+        timeout=120,
+        # تقليل إعادة المحاولة حتى لا تُستهلك الحصة المجانية بسرعة.
+        max_retries=1,
+    )
+
+
+class FallbackChatLLM:
+    """يحوّل تلقائياً إلى نموذج مجاني بديل عند نفاد الحصة أو ازدحام الخدمة."""
+
+    def __init__(self, models: list[str]) -> None:
+        self.models = models
+        self._clients = {name: build_chat_llm(name) for name in models}
+
+    async def ainvoke(self, input, config=None, **kwargs):
+        last_error: Exception | None = None
+        for model_name in self.models:
+            try:
+                result = await self._clients[model_name].ainvoke(
+                    input,
+                    config=config,
+                    **kwargs,
+                )
+                if model_name != self.models[0]:
+                    logger.info("تم استخدام النموذج الاحتياطي: %s", model_name)
+                return result
+            except Exception as exc:
+                last_error = exc
+                if _is_quota_or_overload_error(exc):
+                    logger.warning(
+                        "تعذر استخدام النموذج %s (%s). تجربة بديل...",
+                        model_name,
+                        type(exc).__name__,
+                    )
+                    continue
+                raise
+        assert last_error is not None
+        raise last_error
+
+
+llm = FallbackChatLLM([CHAT_MODEL, *CHAT_MODEL_FALLBACKS])
 
 deep_source_engine = DeepSourceEngine(
     llm=llm,
@@ -503,46 +572,334 @@ def fetch_web_page(url: str) -> tuple[str, str]:
     return title[:300], text[:MAX_WEB_TEXT_CHARS]
 
 
-def fetch_youtube_transcript(video_id: str) -> str:
-    """
-    يجلب تفريغ فيديو YouTube باستخدام الإصدار الحديث
-    من youtube-transcript-api.
-    """
+def _is_quota_error(exc: BaseException) -> bool:
+    text = str(exc)
+    return (
+        "RESOURCE_EXHAUSTED" in text
+        or "exceeded your current quota" in text.lower()
+        or (
+            "429" in text
+            and "quota" in text.lower()
+        )
+    )
 
-    api = YouTubeTranscriptApi()
 
+def _is_youtube_rate_limit_error(exc: BaseException) -> bool:
+    if isinstance(exc, (IpBlocked, RequestBlocked)):
+        return True
+    text = str(exc)
+    return "Too Many Requests" in text or "IpBlocked" in text
+
+
+def _ytdlp_base_opts() -> dict:
+    opts: dict = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "retries": 3,
+        "fragment_retries": 3,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios", "web"],
+            }
+        },
+    }
     try:
-        transcript = api.fetch(
-            video_id,
-            languages=["ar", "en"],
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+
+        opts["impersonate"] = ImpersonateTarget("chrome")
+    except Exception:
+        pass
+
+    cookie_file = os.getenv("YOUTUBE_COOKIES_FILE", "").strip()
+    if cookie_file and Path(cookie_file).is_file():
+        opts["cookiefile"] = cookie_file
+
+    return opts
+
+
+def _transcript_items_to_text(transcript) -> str:
+    parts: list[str] = []
+    for item in transcript:
+        text = getattr(item, "text", None)
+        if text is None and isinstance(item, dict):
+            text = item.get("text", "")
+        if text:
+            parts.append(str(text))
+    return " ".join(parts).strip()
+
+
+def _vtt_to_text(content: str) -> str:
+    lines: list[str] = []
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if (
+            not line
+            or line.startswith("WEBVTT")
+            or line.startswith("NOTE")
+            or line.startswith("Kind:")
+            or line.startswith("Language:")
+            or "-->" in line
+            or re.fullmatch(r"\d+", line)
+        ):
+            continue
+        cleaned = re.sub(r"<[^>]+>", "", line).strip()
+        if cleaned and (not lines or lines[-1] != cleaned):
+            lines.append(cleaned)
+    return " ".join(lines).strip()
+
+
+def _build_youtube_transcript_api() -> YouTubeTranscriptApi:
+    webshare_user = os.getenv("WEBSHARE_PROXY_USERNAME", "").strip()
+    webshare_pass = os.getenv("WEBSHARE_PROXY_PASSWORD", "").strip()
+    if webshare_user and webshare_pass:
+        return YouTubeTranscriptApi(
+            proxy_config=WebshareProxyConfig(
+                proxy_username=webshare_user,
+                proxy_password=webshare_pass,
+            )
         )
 
-        parts = []
-
-        for item in transcript:
-            text = getattr(item, "text", None)
-
-            if text is None and isinstance(item, dict):
-                text = item.get("text", "")
-
-            if text:
-                parts.append(text)
-
-        result = " ".join(parts).strip()
-
-        if not result:
-            raise ValueError(
-                "تم العثور على التفريغ، لكنه لا يحتوي على نص."
+    http_proxy = (
+        os.getenv("YOUTUBE_HTTP_PROXY", "").strip()
+        or os.getenv("HTTPS_PROXY", "").strip()
+        or os.getenv("HTTP_PROXY", "").strip()
+    )
+    https_proxy = os.getenv("YOUTUBE_HTTPS_PROXY", "").strip() or http_proxy
+    if http_proxy or https_proxy:
+        return YouTubeTranscriptApi(
+            proxy_config=GenericProxyConfig(
+                http_url=http_proxy or None,
+                https_url=https_proxy or None,
             )
+        )
 
-        return result
+    return YouTubeTranscriptApi()
 
+
+def _fetch_transcript_via_api(video_id: str) -> str:
+    preferred_languages = ["ar", "en"]
+    api = _build_youtube_transcript_api()
+    transcript_list = api.list(video_id)
+    available = list(transcript_list)
+
+    if not available:
+        raise ValueError("لا يوجد أي تفريغ نصي لهذا الفيديو.")
+
+    last_error: Exception | None = None
+
+    for language_code in preferred_languages:
+        try:
+            fetched = transcript_list.find_transcript([language_code]).fetch()
+            result = _transcript_items_to_text(fetched)
+            if result:
+                return result
+        except Exception as exc:
+            last_error = exc
+
+    for transcript in available:
+        if not getattr(transcript, "is_translatable", False):
+            continue
+
+        translation_codes = {
+            getattr(lang, "language_code", None)
+            for lang in (getattr(transcript, "translation_languages", None) or [])
+        }
+
+        for language_code in preferred_languages:
+            if language_code not in translation_codes:
+                continue
+            try:
+                fetched = transcript.translate(language_code).fetch()
+                result = _transcript_items_to_text(fetched)
+                if result:
+                    return result
+            except Exception as exc:
+                last_error = exc
+
+    for transcript in available:
+        try:
+            result = _transcript_items_to_text(transcript.fetch())
+            if result:
+                return result
+        except Exception as exc:
+            last_error = exc
+
+    if isinstance(last_error, (IpBlocked, RequestBlocked)):
+        raise last_error
+
+    if last_error is not None:
+        raise last_error
+
+    raise ValueError("تم العثور على تفريغات، لكن تعذر استخراج نص منها.")
+
+
+def _fetch_transcript_via_ytdlp(video_id: str) -> str:
+    preferred_languages = ["ar", "en", "tr"]
+    work_dir = DOWNLOADS_DIR / f"yt_subs_{uuid.uuid4().hex}"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    last_error: Exception | None = None
+
+    try:
+        for index, language_code in enumerate(preferred_languages):
+            if index > 0:
+                time.sleep(2)
+
+            outtmpl = str(work_dir / f"{video_id}.%(ext)s")
+            opts = {
+                **_ytdlp_base_opts(),
+                "skip_download": True,
+                "writesubtitles": True,
+                "writeautomaticsub": True,
+                "subtitleslangs": [language_code],
+                "subtitlesformat": "vtt/best",
+                "outtmpl": outtmpl,
+                "sleep_interval_subtitles": 1,
+            }
+            try:
+                with YoutubeDL(opts) as ydl:
+                    ydl.download([url])
+            except Exception as exc:
+                last_error = exc
+                continue
+
+            subtitle_files = sorted(work_dir.glob(f"{video_id}*.vtt"))
+            for subtitle_path in subtitle_files:
+                result = _vtt_to_text(
+                    subtitle_path.read_text(encoding="utf-8", errors="ignore")
+                )
+                if result:
+                    return result
+
+        if last_error is not None:
+            raise last_error
+        raise ValueError("تعذر تنزيل ترجمة الفيديو عبر yt-dlp.")
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def _download_youtube_audio(video_id: str) -> Path:
+    work_dir = DOWNLOADS_DIR / f"yt_audio_{uuid.uuid4().hex}"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    outtmpl = str(work_dir / f"{video_id}.%(ext)s")
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    max_bytes = MAX_AUDIO_SIZE_MB * 1024 * 1024
+
+    opts = {
+        **_ytdlp_base_opts(),
+        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        "outtmpl": outtmpl,
+        "max_filesize": max_bytes,
+    }
+
+    try:
+        with YoutubeDL(opts) as ydl:
+            ydl.download([url])
+
+        audio_files = [
+            path
+            for path in work_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in {
+                ".m4a",
+                ".mp3",
+                ".webm",
+                ".ogg",
+                ".wav",
+                ".mp4",
+                ".opus",
+            }
+        ]
+        if not audio_files:
+            raise ValueError("تعذر تنزيل الصوت من يوتيوب.")
+
+        audio_path = max(audio_files, key=lambda path: path.stat().st_size)
+        if audio_path.stat().st_size > max_bytes:
+            raise ValueError(
+                f"ملف الصوت أكبر من الحد المسموح ({MAX_AUDIO_SIZE_MB} MB)."
+            )
+        return audio_path
+    except Exception:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise
+
+
+def fetch_youtube_transcript(video_id: str) -> str:
+    """
+    يجلب تفريغ فيديو YouTube مع تفضيل العربية والإنجليزية.
+    يستخدم youtube-transcript-api أولاً، ثم yt-dlp عند الفشل،
+    ثم تفريغ الصوت عبر Gemini كحل أخير.
+    """
+
+    errors: list[Exception] = []
+
+    try:
+        return _fetch_transcript_via_api(video_id)
     except Exception as exc:
-        raise RuntimeError(
-            "تعذر جلب تفريغ الفيديو. "
-            "تأكد من أن الفيديو عام ويحتوي على ترجمة أو تفريغ نصي. "
-            f"التفاصيل: {exc}"
-        ) from exc
+        errors.append(exc)
+        logger.warning(
+            "فشل جلب التفريغ عبر youtube-transcript-api للفيديو %s: %s",
+            video_id,
+            exc,
+        )
+
+    try:
+        result = _fetch_transcript_via_ytdlp(video_id)
+        if result:
+            return result
+    except Exception as exc:
+        errors.append(exc)
+        logger.warning(
+            "فشل جلب التفريغ عبر yt-dlp للفيديو %s: %s",
+            video_id,
+            exc,
+        )
+
+    audio_path: Path | None = None
+    try:
+        audio_path = _download_youtube_audio(video_id)
+        mime_type = detect_audio_mime_type(audio_path, None)
+        transcript = transcribe_audio_file(audio_path, mime_type)
+        if transcript:
+            return transcript
+        raise ValueError("تفريغ الصوت لم يُنتج نصاً.")
+    except Exception as exc:
+        errors.append(exc)
+        logger.warning(
+            "فشل تفريغ صوت يوتيوب للفيديو %s: %s",
+            video_id,
+            exc,
+        )
+    finally:
+        if audio_path is not None:
+            shutil.rmtree(audio_path.parent, ignore_errors=True)
+
+    messages: list[str] = []
+    if any(_is_youtube_rate_limit_error(exc) for exc in errors):
+        messages.append(
+            "YouTube يحظر طلبات الترجمة من عنوان IP الحالي مؤقتاً "
+            "(أو يقيّدها بشدة)."
+        )
+    if any(_is_quota_error(exc) for exc in errors):
+        messages.append(
+            "نفدت حصة Gemini المجانية لتفريغ الصوت "
+            f"(النموذج: {CHAT_MODEL}). انتظر إعادة التعيين أو استخدم مفتاحاً/خطة أخرى."
+        )
+
+    if messages:
+        messages.append(
+            "اختياري: أضف بروكسي سكني في .env عبر "
+            "WEBSHARE_PROXY_USERNAME و WEBSHARE_PROXY_PASSWORD، "
+            "أو ملف كوكيز عبر YOUTUBE_COOKIES_FILE."
+        )
+        raise RuntimeError(" ".join(messages))
+
+    details = " | ".join(str(exc).splitlines()[0] for exc in errors[-3:])
+    raise RuntimeError(
+        "تعذر جلب تفريغ الفيديو. "
+        "تأكد من أن الفيديو عام ويحتوي على ترجمة أو تفريغ نصي. "
+        f"التفاصيل: {details}"
+    )
 
 
 def detect_audio_mime_type(
@@ -589,25 +946,46 @@ def transcribe_audio_file(
         "لا تضف شرحًا أو مقدمة أو تعليقًا خارج التفريغ النصي."
     )
 
-    response = genai_client.models.generate_content(
-        model=CHAT_MODEL,
-        contents=[
-            prompt,
-            types.Part.from_bytes(
-                data=audio_bytes,
-                mime_type=mime_type,
-            ),
-        ],
-    )
+    models_to_try = [CHAT_MODEL, *CHAT_MODEL_FALLBACKS]
+    last_error: Exception | None = None
 
-    transcript = (response.text or "").strip()
+    for model_name in models_to_try:
+        try:
+            response = genai_client.models.generate_content(
+                model=model_name,
+                contents=[
+                    prompt,
+                    types.Part.from_bytes(
+                        data=audio_bytes,
+                        mime_type=mime_type,
+                    ),
+                ],
+            )
+            transcript = (response.text or "").strip()
+            if transcript:
+                if model_name != CHAT_MODEL:
+                    logger.info(
+                        "تم تفريغ الصوت باستخدام النموذج الاحتياطي: %s",
+                        model_name,
+                    )
+                return transcript
+            last_error = ValueError(
+                "لم يتمكن Gemini من استخراج نص من التسجيل الصوتي."
+            )
+        except Exception as exc:
+            last_error = exc
+            if _is_quota_error(exc):
+                logger.warning(
+                    "نفدت حصة النموذج %s أثناء تفريغ الصوت، سيتم تجربة بديل.",
+                    model_name,
+                )
+                continue
+            raise
 
-    if not transcript:
-        raise ValueError(
-            "لم يتمكن Gemini من استخراج نص من التسجيل الصوتي."
-        )
+    if last_error is not None:
+        raise last_error
 
-    return transcript
+    raise ValueError("لم يتمكن Gemini من استخراج نص من التسجيل الصوتي.")
 
 
 
@@ -930,7 +1308,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "أرسل لي:\n"
         "• ملف PDF لإضافته إلى مصادرك.\n"
         "• رابط مقال ويب عام.\n"
-        "• رابط فيديو YouTube يحتوي على ترجمة أو تفريغ.\n"
+        "• رابط فيديو YouTube يحتوي على ترجمة أو تفريغ (أي لغة).\n"
         "• رسالة صوتية أو ملف صوت لتحويله إلى نص.\n"
         "• سؤالًا عن المصادر المضافة.\n\n"
         "الأوامر:\n"

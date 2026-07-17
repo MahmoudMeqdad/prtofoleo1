@@ -3,6 +3,7 @@ python-dotenv>=1.0,<2
 requests>=2.32,<3
 beautifulsoup4>=4.12,<5
 youtube-transcript-api>=1.2,<2
+yt-dlp[default,curl-cffi]>=2025.1.0
 gTTS>=2.5,<3
 pypdf>=5,<7
 chromadb>=1.0,<2
