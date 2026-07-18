@@ -132,14 +132,14 @@ FULL_SUMMARY_MAX_BATCHES = max(
 
 
 # إعدادات التحكم في حصة Gemini Embeddings المجانية.
-# الدفعات الصغيرة مع الانتظار تمنع تجاوز 100 طلب في الدقيقة.
+# دفعة أكبر + تأخير قصير يسرّع الرفع، مع إعادة محاولة عند 429.
 EMBEDDING_BATCH_SIZE = max(
     1,
-    int(os.getenv("EMBEDDING_BATCH_SIZE", "10")),
+    int(os.getenv("EMBEDDING_BATCH_SIZE", "48")),
 )
 EMBEDDING_BATCH_DELAY = max(
     0.0,
-    float(os.getenv("EMBEDDING_BATCH_DELAY", "7")),
+    float(os.getenv("EMBEDDING_BATCH_DELAY", "1.0")),
 )
 EMBEDDING_MAX_RETRIES = max(
     1,
@@ -237,9 +237,9 @@ deep_source_engine = DeepSourceEngine(
 )
 
 text_splitter = RecursiveCharacterTextSplitter(
-    # مقاطع أكبر تعني عدد طلبات Embeddings أقل.
-    chunk_size=3000,
-    chunk_overlap=300,
+    # مقاطع أكبر تعني عدد طلبات Embeddings أقل ورفعًا أسرع.
+    chunk_size=4000,
+    chunk_overlap=250,
     separators=["\n\n", "\n", ". ", "؟ ", "! ", " ", ""],
 )
 
@@ -383,9 +383,13 @@ def extract_retry_seconds(exc: Exception) -> float | None:
     return None
 
 
-def add_documents(storage_id: str, documents: list[Document]) -> int:
+def add_documents(
+    storage_id: str,
+    documents: list[Document],
+    progress_callback=None,
+) -> int:
     """
-    يقسّم المحتوى ويضيفه إلى Chroma على دفعات صغيرة.
+    يقسّم المحتوى ويضيفه إلى Chroma على دفعات.
 
     عند تجاوز حصة Gemini المجانية ينتظر تلقائيًا ثم يعيد المحاولة،
     بدل إيقاف رفع الملف بالكامل من أول خطأ 429.
@@ -408,6 +412,9 @@ def add_documents(storage_id: str, documents: list[Document]) -> int:
         total_batches,
         EMBEDDING_BATCH_SIZE,
     )
+
+    if progress_callback is not None:
+        progress_callback(0, total_batches, 0, len(chunks))
 
     for batch_number, start in enumerate(
         range(0, len(chunks), EMBEDDING_BATCH_SIZE),
@@ -466,11 +473,90 @@ def add_documents(storage_id: str, documents: list[Document]) -> int:
                 )
                 time.sleep(wait_seconds)
 
-        # تهدئة ثابتة بين الدفعات لتجنب تجاوز 100 طلب/دقيقة.
+        if progress_callback is not None:
+            progress_callback(
+                batch_number,
+                total_batches,
+                total_added,
+                len(chunks),
+            )
+
+        # تهدئة قصيرة بين الدفعات؛ عند 429 تُعاد المحاولة تلقائيًا.
         if batch_number < total_batches and EMBEDDING_BATCH_DELAY > 0:
             time.sleep(EMBEDDING_BATCH_DELAY)
 
     return total_added
+
+
+async def add_documents_with_status(
+    status_message,
+    storage_id: str,
+    documents: list[Document],
+    *,
+    label: str,
+) -> int:
+    """يفهرس المستندات مع تحديث رسالة التقدّم في تيليجرام."""
+    loop = asyncio.get_running_loop()
+    last_edit_at = 0.0
+    edit_lock = asyncio.Lock()
+
+    async def _edit_progress(
+        batch_number: int,
+        total_batches: int,
+        total_added: int,
+        total_chunks: int,
+    ) -> None:
+        nonlocal last_edit_at
+        now = time.monotonic()
+        # تجنب تجاوز حد تعديل رسائل تيليجرام.
+        if batch_number not in {0, total_batches} and now - last_edit_at < 2.5:
+            return
+        async with edit_lock:
+            now = time.monotonic()
+            if batch_number not in {0, total_batches} and now - last_edit_at < 2.5:
+                return
+            percent = (
+                0
+                if total_batches == 0
+                else int((batch_number / total_batches) * 100)
+            )
+            text = (
+                f"⏳ {label}\n"
+                f"الفهرسة: {total_added}/{total_chunks} مقطع"
+                f" ({percent}%)"
+            )
+            try:
+                await status_message.edit_text(text)
+                last_edit_at = time.monotonic()
+            except Exception:
+                logger.debug("تعذر تحديث رسالة التقدّم", exc_info=True)
+
+    def progress_callback(
+        batch_number: int,
+        total_batches: int,
+        total_added: int,
+        total_chunks: int,
+    ) -> None:
+        future = asyncio.run_coroutine_threadsafe(
+            _edit_progress(
+                batch_number,
+                total_batches,
+                total_added,
+                total_chunks,
+            ),
+            loop,
+        )
+        try:
+            future.result(timeout=10)
+        except Exception:
+            logger.debug("تعذر انتظار تحديث التقدّم", exc_info=True)
+
+    return await asyncio.to_thread(
+        add_documents,
+        storage_id,
+        documents,
+        progress_callback,
+    )
 
 
 async def send_long_text(
@@ -1804,14 +1890,16 @@ async def handle_document(
     )
 
     status = await message.reply_text(
-        f"⏳ جاري تنزيل وتحليل الملف: {file_name}\n"
-        "قد يستغرق الملف الكبير وقتًا إضافيًا لتجنب تجاوز حصة Google المجانية."
+        f"⏳ جاري تنزيل الملف: {file_name}"
     )
 
     try:
         telegram_file = await document.get_file()
         await telegram_file.download_to_drive(custom_path=file_path)
 
+        await status.edit_text(
+            f"📄 جاري استخراج النص من: {file_name}"
+        )
         docs = await asyncio.to_thread(load_pdf, file_path, file_name)
 
         if not docs:
@@ -1819,10 +1907,11 @@ async def handle_document(
                 "لم أتمكن من استخراج نص من الملف؛ قد يكون PDF مصورًا."
             )
 
-        chunk_count = await asyncio.to_thread(
-            add_documents,
+        chunk_count = await add_documents_with_status(
+            status,
             storage_id,
             docs,
+            label=f"جاري فهرسة الملف: {file_name}",
         )
 
         await status.edit_text(
@@ -1927,10 +2016,11 @@ async def handle_audio(
             )
         ]
 
-        chunk_count = await asyncio.to_thread(
-            add_documents,
+        chunk_count = await add_documents_with_status(
+            status,
             storage_id,
             docs,
+            label=f"جاري فهرسة التسجيل: {original_name}",
         )
 
         await status.edit_text(
@@ -1993,10 +2083,11 @@ async def handle_url(
                 )
             ]
 
-            chunk_count = await asyncio.to_thread(
-                add_documents,
+            chunk_count = await add_documents_with_status(
+                status,
                 storage_id,
                 docs,
+                label="جاري فهرسة نص YouTube",
             )
 
             await status.edit_text(
@@ -2018,10 +2109,11 @@ async def handle_url(
             )
         ]
 
-        chunk_count = await asyncio.to_thread(
-            add_documents,
+        chunk_count = await add_documents_with_status(
+            status,
             storage_id,
             docs,
+            label=f"جاري فهرسة الصفحة: {title[:80]}",
         )
 
         await status.edit_text(
