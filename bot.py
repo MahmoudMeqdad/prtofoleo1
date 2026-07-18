@@ -295,13 +295,50 @@ def user_vector_dir(storage_id: str) -> Path:
     return path
 
 
-def get_vector_store(storage_id: str) -> Chroma:
-    """يفتح مخزن المستخدم نفسه في كل مرة."""
-    return Chroma(
-        collection_name=f"notebook_{storage_id.replace('-', 'n')}",
-        persist_directory=str(user_vector_dir(storage_id)),
-        embedding_function=embeddings,
+def is_chroma_schema_error(exc: BaseException) -> bool:
+    """يكتشف تلف مخطط Chroma (مثل غياب جدول tenants)."""
+    text = str(exc).lower()
+    markers = (
+        "no such table: tenants",
+        "no such table: databases",
+        "could not connect to tenant",
+        "default_tenant",
     )
+    return any(marker in text for marker in markers)
+
+
+def reset_user_vector_store(storage_id: str) -> None:
+    """يحذف مجلد Chroma التالف ويعيد إنشاءه فارغًا."""
+    path = VECTOR_DB_DIR / storage_id
+    if path.exists():
+        shutil.rmtree(path, ignore_errors=True)
+    path.mkdir(parents=True, exist_ok=True)
+    logger.warning(
+        "أُعيد إنشاء مخزن Chroma للمستخدم %s بسبب تلف المخطط",
+        storage_id,
+    )
+
+
+def get_vector_store(storage_id: str, *, allow_reset: bool = True) -> Chroma:
+    """يفتح مخزن المستخدم نفسه في كل مرة، مع إصلاح تلقائي عند تلف Chroma."""
+    collection_name = f"notebook_{storage_id.replace('-', 'n')}"
+    persist_directory = str(user_vector_dir(storage_id))
+
+    try:
+        return Chroma(
+            collection_name=collection_name,
+            persist_directory=persist_directory,
+            embedding_function=embeddings,
+        )
+    except Exception as exc:
+        if not allow_reset or not is_chroma_schema_error(exc):
+            raise
+        reset_user_vector_store(storage_id)
+        return Chroma(
+            collection_name=collection_name,
+            persist_directory=str(user_vector_dir(storage_id)),
+            embedding_function=embeddings,
+        )
 
 
 def database_has_documents(storage_id: str) -> bool:
@@ -359,6 +396,7 @@ def add_documents(storage_id: str, documents: list[Document]) -> int:
         return 0
 
     store = get_vector_store(storage_id)
+    schema_reset_done = False
     total_added = 0
     total_batches = (
         len(chunks) + EMBEDDING_BATCH_SIZE - 1
@@ -395,6 +433,12 @@ def add_documents(storage_id: str, documents: list[Document]) -> int:
                 break
 
             except Exception as exc:
+                if is_chroma_schema_error(exc) and not schema_reset_done:
+                    reset_user_vector_store(storage_id)
+                    store = get_vector_store(storage_id, allow_reset=False)
+                    schema_reset_done = True
+                    continue
+
                 if not is_quota_error(exc):
                     raise
 
@@ -1992,6 +2036,12 @@ async def handle_url(
         )
     except Exception as exc:
         logger.exception("فشل معالجة الرابط")
+        if is_chroma_schema_error(exc):
+            await status.edit_text(
+                "❌ تعذر إضافة الرابط: قاعدة المصادر تالفة وتمت محاولة إصلاحها.\n"
+                "أعد إرسال الرابط مرة واحدة، أو استخدم /reset ثم أعد المحاولة."
+            )
+            return
         await status.edit_text(f"❌ تعذر إضافة الرابط: {exc}")
 
 
