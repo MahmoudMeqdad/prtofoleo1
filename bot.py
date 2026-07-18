@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import ipaddress
 import logging
 import mimetypes
@@ -8,6 +9,7 @@ import os
 import re
 import shutil
 import socket
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -37,10 +39,7 @@ from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_google_genai import (
-    ChatGoogleGenerativeAI,
-    GoogleGenerativeAIEmbeddings,
-)
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from research_core import ResearchPlatform
@@ -132,14 +131,14 @@ FULL_SUMMARY_MAX_BATCHES = max(
 
 
 # إعدادات التحكم في حصة Gemini Embeddings المجانية.
-# دفعة أكبر + تأخير قصير يسرّع الرفع، مع إعادة محاولة عند 429.
+# دفعات متوسطة + مهلة صارمة تمنع التعليق الطويل عند بطء الشبكة/API.
 EMBEDDING_BATCH_SIZE = max(
     1,
-    int(os.getenv("EMBEDDING_BATCH_SIZE", "48")),
+    int(os.getenv("EMBEDDING_BATCH_SIZE", "16")),
 )
 EMBEDDING_BATCH_DELAY = max(
     0.0,
-    float(os.getenv("EMBEDDING_BATCH_DELAY", "1.0")),
+    float(os.getenv("EMBEDDING_BATCH_DELAY", "0.25")),
 )
 EMBEDDING_MAX_RETRIES = max(
     1,
@@ -147,7 +146,11 @@ EMBEDDING_MAX_RETRIES = max(
 )
 EMBEDDING_RETRY_BASE_DELAY = max(
     1.0,
-    float(os.getenv("EMBEDDING_RETRY_BASE_DELAY", "25")),
+    float(os.getenv("EMBEDDING_RETRY_BASE_DELAY", "20")),
+)
+EMBEDDING_REQUEST_TIMEOUT = max(
+    10.0,
+    float(os.getenv("EMBEDDING_REQUEST_TIMEOUT", "40")),
 )
 
 logging.basicConfig(
@@ -156,13 +159,111 @@ logging.basicConfig(
 )
 logger = logging.getLogger("notebook_telegram_bot")
 
-# عميل Google GenAI لمعالجة الصوت مباشرة.
-genai_client = genai.Client(api_key=GOOGLE_API_KEY)
-
-embeddings = GoogleGenerativeAIEmbeddings(
-    model=EMBEDDING_MODEL,
-    google_api_key=GOOGLE_API_KEY,
+# عميل Google GenAI للصوت والتضمين.
+# مهلة عامة أطول للصوت؛ للتضمين تُفرض مهلة أقصر داخل _embed_texts.
+genai_client = genai.Client(
+    api_key=GOOGLE_API_KEY,
+    http_options=types.HttpOptions(timeout=180_000),
 )
+
+
+def _embedding_model_name() -> str:
+    return EMBEDDING_MODEL.removeprefix("models/")
+
+
+def _embed_texts(texts: list[str], *, task_type: str) -> list[list[float]]:
+    """يضمّن النصوص عبر Gemini مع مهلة صارمة لمنع التعليق."""
+    if not texts:
+        return []
+
+    model = _embedding_model_name()
+
+    embed_http = types.HttpOptions(
+        timeout=int(EMBEDDING_REQUEST_TIMEOUT * 1000),
+    )
+
+    def _call_batch() -> list[list[float]]:
+        response = genai_client.models.embed_content(
+            model=model,
+            contents=texts,
+            config=types.EmbedContentConfig(
+                task_type=task_type,
+                http_options=embed_http,
+            ),
+        )
+        embeddings_list = getattr(response, "embeddings", None) or []
+        if len(embeddings_list) != len(texts):
+            raise RuntimeError(
+                f"عدد متجهات التضمين ({len(embeddings_list)}) "
+                f"لا يطابق عدد النصوص ({len(texts)})."
+            )
+        return [list(item.values) for item in embeddings_list]
+
+    def _call_one_by_one() -> list[list[float]]:
+        vectors: list[list[float]] = []
+        for text in texts:
+            response = genai_client.models.embed_content(
+                model=model,
+                contents=text,
+                config=types.EmbedContentConfig(
+                    task_type=task_type,
+                    http_options=embed_http,
+                ),
+            )
+            embeddings_list = getattr(response, "embeddings", None) or []
+            if not embeddings_list:
+                raise RuntimeError("استجابة Embeddings فارغة من Gemini.")
+            vectors.append(list(embeddings_list[0].values))
+        return vectors
+
+    def _call() -> list[list[float]]:
+        try:
+            return _call_batch()
+        except Exception:
+            logger.warning(
+                "فشل التضمين الجماعي (%s نصوص)، الانتقال للتضمين الفردي",
+                len(texts),
+                exc_info=True,
+            )
+            return _call_one_by_one()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(_call)
+        try:
+            return future.result(timeout=EMBEDDING_REQUEST_TIMEOUT)
+        except concurrent.futures.TimeoutError as exc:
+            raise TimeoutError(
+                f"انتهت مهلة طلب Embeddings بعد "
+                f"{EMBEDDING_REQUEST_TIMEOUT:.0f} ثانية. "
+                "تحقق من الإنترنت أو أعد المحاولة."
+            ) from exc
+
+
+class TimedGeminiEmbeddings:
+    """طبقة Embeddings متوافقة مع Chroma وبدون تعليق طويل."""
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return _embed_texts(list(texts), task_type="RETRIEVAL_DOCUMENT")
+
+    def embed_query(self, text: str) -> list[float]:
+        return _embed_texts([text], task_type="RETRIEVAL_QUERY")[0]
+
+
+embeddings = TimedGeminiEmbeddings()
+
+# قفل وذاكرة مؤقتة لكل مستخدم لتجنب تعارض SQLite عند الطلبات المتزامنة.
+_store_cache: dict[str, Chroma] = {}
+_store_locks: dict[str, threading.RLock] = {}
+_store_locks_guard = threading.Lock()
+
+
+def _lock_for(storage_id: str) -> threading.RLock:
+    with _store_locks_guard:
+        lock = _store_locks.get(storage_id)
+        if lock is None:
+            lock = threading.RLock()
+            _store_locks[storage_id] = lock
+        return lock
 
 
 def _is_quota_or_overload_error(exc: BaseException) -> bool:
@@ -307,44 +408,61 @@ def is_chroma_schema_error(exc: BaseException) -> bool:
     return any(marker in text for marker in markers)
 
 
-def reset_user_vector_store(storage_id: str) -> None:
-    """يحذف مجلد Chroma التالف ويعيد إنشاءه فارغًا."""
-    path = VECTOR_DB_DIR / storage_id
-    if path.exists():
-        shutil.rmtree(path, ignore_errors=True)
-    path.mkdir(parents=True, exist_ok=True)
-    logger.warning(
-        "أُعيد إنشاء مخزن Chroma للمستخدم %s بسبب تلف المخطط",
-        storage_id,
-    )
+def reset_user_vector_store(
+    storage_id: str,
+    *,
+    reason: str = "إعادة تعيين",
+) -> None:
+    """يحذف مجلد Chroma ويعيد إنشاءه فارغًا."""
+    with _lock_for(storage_id):
+        _store_cache.pop(storage_id, None)
+        path = VECTOR_DB_DIR / storage_id
+        if path.exists():
+            shutil.rmtree(path, ignore_errors=True)
+        path.mkdir(parents=True, exist_ok=True)
+        logger.info(
+            "أُعيد إنشاء مخزن Chroma للمستخدم %s (%s)",
+            storage_id,
+            reason,
+        )
 
 
 def get_vector_store(storage_id: str, *, allow_reset: bool = True) -> Chroma:
-    """يفتح مخزن المستخدم نفسه في كل مرة، مع إصلاح تلقائي عند تلف Chroma."""
+    """يفتح مخزن المستخدم مع تخزين مؤقت وقفل لتفادي تعارض SQLite."""
     collection_name = f"notebook_{storage_id.replace('-', 'n')}"
-    persist_directory = str(user_vector_dir(storage_id))
 
-    try:
-        return Chroma(
-            collection_name=collection_name,
-            persist_directory=persist_directory,
-            embedding_function=embeddings,
-        )
-    except Exception as exc:
-        if not allow_reset or not is_chroma_schema_error(exc):
-            raise
-        reset_user_vector_store(storage_id)
-        return Chroma(
-            collection_name=collection_name,
-            persist_directory=str(user_vector_dir(storage_id)),
-            embedding_function=embeddings,
-        )
+    with _lock_for(storage_id):
+        cached = _store_cache.get(storage_id)
+        if cached is not None:
+            return cached
+
+        persist_directory = str(user_vector_dir(storage_id))
+
+        try:
+            store = Chroma(
+                collection_name=collection_name,
+                persist_directory=persist_directory,
+                embedding_function=embeddings,
+            )
+        except Exception as exc:
+            if not allow_reset or not is_chroma_schema_error(exc):
+                raise
+            reset_user_vector_store(storage_id, reason="تلف مخطط Chroma")
+            store = Chroma(
+                collection_name=collection_name,
+                persist_directory=str(user_vector_dir(storage_id)),
+                embedding_function=embeddings,
+            )
+
+        _store_cache[storage_id] = store
+        return store
 
 
 def database_has_documents(storage_id: str) -> bool:
     try:
-        store = get_vector_store(storage_id)
-        return store._collection.count() > 0
+        with _lock_for(storage_id):
+            store = get_vector_store(storage_id)
+            return store._collection.count() > 0
     except Exception:
         logger.exception("تعذر فحص قاعدة المستخدم %s", storage_id)
         return False
@@ -383,6 +501,31 @@ def extract_retry_seconds(exc: Exception) -> float | None:
     return None
 
 
+def _add_documents_batch(
+    storage_id: str,
+    batch: list[Document],
+    ids: list[str],
+    *,
+    schema_reset_done: bool,
+) -> tuple[Chroma, bool]:
+    """يضيف دفعة واحدة تحت قفل المستخدم مع إصلاح مخطط Chroma عند الحاجة."""
+    with _lock_for(storage_id):
+        store = get_vector_store(storage_id)
+        try:
+            store.add_documents(documents=batch, ids=ids)
+            return store, schema_reset_done
+        except Exception as exc:
+            if is_chroma_schema_error(exc) and not schema_reset_done:
+                reset_user_vector_store(
+                    storage_id,
+                    reason="تلف مخطط Chroma أثناء الإضافة",
+                )
+                store = get_vector_store(storage_id, allow_reset=False)
+                store.add_documents(documents=batch, ids=ids)
+                return store, True
+            raise
+
+
 def add_documents(
     storage_id: str,
     documents: list[Document],
@@ -399,7 +542,6 @@ def add_documents(
     if not chunks:
         return 0
 
-    store = get_vector_store(storage_id)
     schema_reset_done = False
     total_added = 0
     total_batches = (
@@ -425,9 +567,11 @@ def add_documents(
 
         for attempt in range(1, EMBEDDING_MAX_RETRIES + 1):
             try:
-                store.add_documents(
-                    documents=batch,
-                    ids=ids,
+                _, schema_reset_done = _add_documents_batch(
+                    storage_id,
+                    batch,
+                    ids,
+                    schema_reset_done=schema_reset_done,
                 )
                 total_added += len(batch)
 
@@ -440,38 +584,35 @@ def add_documents(
                 break
 
             except Exception as exc:
-                if is_chroma_schema_error(exc) and not schema_reset_done:
-                    reset_user_vector_store(storage_id)
-                    store = get_vector_store(storage_id, allow_reset=False)
-                    schema_reset_done = True
+                if isinstance(exc, TimeoutError) or is_quota_error(exc):
+                    if attempt >= EMBEDDING_MAX_RETRIES:
+                        if isinstance(exc, TimeoutError):
+                            raise
+                        raise RuntimeError(
+                            "تم تجاوز حصة Gemini Embeddings عدة مرات. "
+                            "انتظر دقيقة ثم أعد المحاولة، أو فعّل الفوترة "
+                            "لرفع حدود الاستخدام."
+                        ) from exc
+
+                    suggested_delay = extract_retry_seconds(exc)
+                    wait_seconds = max(
+                        EMBEDDING_RETRY_BASE_DELAY * attempt,
+                        (suggested_delay or 0) + 2,
+                    )
+                    logger.warning(
+                        "تعذر فهرسة الدفعة %s/%s (%s). "
+                        "الانتظار %.1f ثانية، المحاولة %s/%s.",
+                        batch_number,
+                        total_batches,
+                        type(exc).__name__,
+                        wait_seconds,
+                        attempt,
+                        EMBEDDING_MAX_RETRIES,
+                    )
+                    time.sleep(wait_seconds)
                     continue
 
-                if not is_quota_error(exc):
-                    raise
-
-                if attempt >= EMBEDDING_MAX_RETRIES:
-                    raise RuntimeError(
-                        "تم تجاوز حصة Gemini Embeddings عدة مرات. "
-                        "انتظر دقيقة ثم أعد المحاولة، أو فعّل الفوترة "
-                        "لرفع حدود الاستخدام."
-                    ) from exc
-
-                suggested_delay = extract_retry_seconds(exc)
-                wait_seconds = max(
-                    EMBEDDING_RETRY_BASE_DELAY * attempt,
-                    (suggested_delay or 0) + 2,
-                )
-
-                logger.warning(
-                    "تجاوز حصة Embeddings في الدفعة %s/%s. "
-                    "الانتظار %.1f ثانية، المحاولة %s/%s.",
-                    batch_number,
-                    total_batches,
-                    wait_seconds,
-                    attempt,
-                    EMBEDDING_MAX_RETRIES,
-                )
-                time.sleep(wait_seconds)
+                raise
 
         if progress_callback is not None:
             progress_callback(
@@ -481,7 +622,6 @@ def add_documents(
                 len(chunks),
             )
 
-        # تهدئة قصيرة بين الدفعات؛ عند 429 تُعاد المحاولة تلقائيًا.
         if batch_number < total_batches and EMBEDDING_BATCH_DELAY > 0:
             time.sleep(EMBEDDING_BATCH_DELAY)
 
@@ -495,68 +635,118 @@ async def add_documents_with_status(
     *,
     label: str,
 ) -> int:
-    """يفهرس المستندات مع تحديث رسالة التقدّم في تيليجرام."""
-    loop = asyncio.get_running_loop()
+    """يفهرس المستندات بشكل غير حاجب مع تحديث التقدّم ومهلة لكل دفعة."""
+    chunks = await asyncio.to_thread(text_splitter.split_documents, documents)
+    if not chunks:
+        return 0
+
+    total_chunks = len(chunks)
+    total_batches = (
+        total_chunks + EMBEDDING_BATCH_SIZE - 1
+    ) // EMBEDDING_BATCH_SIZE
+    schema_reset_done = False
+    total_added = 0
     last_edit_at = 0.0
-    edit_lock = asyncio.Lock()
+    batch_timeout = EMBEDDING_REQUEST_TIMEOUT + 20
 
     async def _edit_progress(
         batch_number: int,
-        total_batches: int,
-        total_added: int,
-        total_chunks: int,
+        total_added_now: int,
+        *,
+        force: bool = False,
     ) -> None:
         nonlocal last_edit_at
         now = time.monotonic()
-        # تجنب تجاوز حد تعديل رسائل تيليجرام.
-        if batch_number not in {0, total_batches} and now - last_edit_at < 2.5:
+        if not force and now - last_edit_at < 1.5:
             return
-        async with edit_lock:
-            now = time.monotonic()
-            if batch_number not in {0, total_batches} and now - last_edit_at < 2.5:
-                return
-            percent = (
-                0
-                if total_batches == 0
-                else int((batch_number / total_batches) * 100)
-            )
+        percent = (
+            0
+            if total_batches == 0
+            else int((batch_number / total_batches) * 100)
+        )
+        if batch_number == 0:
             text = (
                 f"⏳ {label}\n"
-                f"الفهرسة: {total_added}/{total_chunks} مقطع"
+                f"بدء الفهرسة: {total_chunks} مقطع..."
+            )
+        else:
+            text = (
+                f"⏳ {label}\n"
+                f"الفهرسة: {total_added_now}/{total_chunks} مقطع"
                 f" ({percent}%)"
             )
-            try:
-                await status_message.edit_text(text)
-                last_edit_at = time.monotonic()
-            except Exception:
-                logger.debug("تعذر تحديث رسالة التقدّم", exc_info=True)
-
-    def progress_callback(
-        batch_number: int,
-        total_batches: int,
-        total_added: int,
-        total_chunks: int,
-    ) -> None:
-        future = asyncio.run_coroutine_threadsafe(
-            _edit_progress(
-                batch_number,
-                total_batches,
-                total_added,
-                total_chunks,
-            ),
-            loop,
-        )
         try:
-            future.result(timeout=10)
+            await status_message.edit_text(text)
+            last_edit_at = time.monotonic()
         except Exception:
-            logger.debug("تعذر انتظار تحديث التقدّم", exc_info=True)
+            logger.debug("تعذر تحديث رسالة التقدّم", exc_info=True)
 
-    return await asyncio.to_thread(
-        add_documents,
-        storage_id,
-        documents,
-        progress_callback,
-    )
+    await _edit_progress(0, 0, force=True)
+
+    for batch_number, start in enumerate(
+        range(0, total_chunks, EMBEDDING_BATCH_SIZE),
+        start=1,
+    ):
+        batch = chunks[start : start + EMBEDDING_BATCH_SIZE]
+        ids = [str(uuid.uuid4()) for _ in batch]
+
+        for attempt in range(1, EMBEDDING_MAX_RETRIES + 1):
+            try:
+                _, schema_reset_done = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _add_documents_batch,
+                        storage_id,
+                        batch,
+                        ids,
+                        schema_reset_done=schema_reset_done,
+                    ),
+                    timeout=batch_timeout,
+                )
+                total_added += len(batch)
+                break
+            except asyncio.TimeoutError as exc:
+                if attempt >= EMBEDDING_MAX_RETRIES:
+                    raise TimeoutError(
+                        f"انتهت مهلة فهرسة الدفعة بعد "
+                        f"{batch_timeout:.0f} ثانية. "
+                        "أعد رفع الملف أو تحقق من مفتاح Gemini."
+                    ) from exc
+                wait_seconds = EMBEDDING_RETRY_BASE_DELAY * attempt
+                logger.warning(
+                    "انتهت مهلة الدفعة %s/%s. إعادة بعد %.1f ث",
+                    batch_number,
+                    total_batches,
+                    wait_seconds,
+                )
+                await _edit_progress(batch_number - 1, total_added, force=True)
+                await asyncio.sleep(wait_seconds)
+            except Exception as exc:
+                if is_quota_error(exc) and attempt < EMBEDDING_MAX_RETRIES:
+                    suggested_delay = extract_retry_seconds(exc)
+                    wait_seconds = max(
+                        EMBEDDING_RETRY_BASE_DELAY * attempt,
+                        (suggested_delay or 0) + 2,
+                    )
+                    logger.warning(
+                        "حصة Embeddings في الدفعة %s/%s. انتظار %.1f ث",
+                        batch_number,
+                        total_batches,
+                        wait_seconds,
+                    )
+                    await asyncio.sleep(wait_seconds)
+                    continue
+                raise
+
+        await _edit_progress(
+            batch_number,
+            total_added,
+            force=(batch_number == total_batches),
+        )
+
+        if batch_number < total_batches and EMBEDDING_BATCH_DELAY > 0:
+            await asyncio.sleep(EMBEDDING_BATCH_DELAY)
+
+    return total_added
 
 
 async def send_long_text(
@@ -1839,12 +2029,11 @@ async def reset_notebook(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     storage_id = user_storage_id(update)
-    vector_path = VECTOR_DB_DIR / storage_id
     download_path = DOWNLOADS_DIR / storage_id
 
-    for path in (vector_path, download_path):
-        if path.exists():
-            shutil.rmtree(path, ignore_errors=True)
+    reset_user_vector_store(storage_id)
+    if download_path.exists():
+        shutil.rmtree(download_path, ignore_errors=True)
 
     chat_histories.pop(storage_id, None)
     selected_sources.pop(storage_id, None)
